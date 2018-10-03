@@ -56,6 +56,9 @@ namespace QuantConnect.Lean.Engine.Results
         //Update loop:
         private DateTime _nextUpdate;
         private DateTime _nextChartsUpdate;
+        private DateTime _nextDeltaChartsUpdate;
+        private DateTime _nextChartTrimming;
+        private readonly int _nextChartTrimmingDayPeriod = 2;
         private DateTime _nextRunningStatus;
         private DateTime _nextLogStoreUpdate;
         private DateTime _nextStatisticsUpdate;
@@ -150,7 +153,7 @@ namespace QuantConnect.Lean.Engine.Results
                     if (Messages.Count == 0)
                     {
                         // prevent thread lock/tight loop when there's no work to be done
-                        Thread.Sleep(10);
+                        Thread.Sleep(100);
                     }
                 }
                 catch (Exception err)
@@ -178,7 +181,8 @@ namespace QuantConnect.Lean.Engine.Results
 
             try
             {
-                if (DateTime.UtcNow > _nextUpdate || _exitTriggered)
+                var utcNow = DateTime.UtcNow;
+                if (utcNow > _nextUpdate || _exitTriggered)
                 {
                     //Extract the orders created since last update
                     OrderEvent orderEvent;
@@ -204,27 +208,33 @@ namespace QuantConnect.Lean.Engine.Results
                     //Limit length of orders we pass back dynamically to avoid flooding.
                     //if (deltaOrders.Count > 50) deltaOrders.Clear();
 
+
                     //Create and send back the changes in chart since the algorithm started.
                     var deltaCharts = new Dictionary<string, Chart>();
-                    Log.Debug("LiveTradingResultHandler.Update(): Build delta charts");
-                    lock (_chartLock)
+                    if (utcNow > _nextDeltaChartsUpdate)
                     {
-                        //Get the updates since the last chart
-                        foreach (var chart in Charts)
+                        Log.Debug("LiveTradingResultHandler.Update(): Build delta charts");
+                        lock (_chartLock)
                         {
-                            // remove directory pathing characters from chart names
-                            var safeName = chart.Value.Name.Replace('/', '-');
-                            DictionarySafeAdd(deltaCharts, safeName, chart.Value.GetUpdates(), "deltaCharts");
+                            //Get the updates since the last chart
+                            foreach (var chart in Charts)
+                            {
+                                // remove directory pathing characters from chart names
+                                var safeName = chart.Value.Name.Replace('/', '-');
+                                DictionarySafeAdd(deltaCharts, safeName, chart.Value.GetUpdates(), "deltaCharts");
+                            }
                         }
+                        Log.Debug("LiveTradingResultHandler.Update(): End build delta charts");
+                        // 'deltaCharts' will be sent at 1/4 of the frequency of 'chartComplete'
+                        _nextDeltaChartsUpdate = utcNow.AddTicks(GetChartPeriodUpdate().Ticks / 4);
                     }
-                    Log.Debug("LiveTradingResultHandler.Update(): End build delta charts");
 
                     //Profit loss changes, get the banner statistics, summary information on the performance for the headers.
                     var holdings = new Dictionary<string, Holding>();
                     var deltaStatistics = new Dictionary<string, string>();
                     var runtimeStatistics = new Dictionary<string, string>();
                     var serverStatistics = OS.GetServerStatistics();
-                    var upTime = DateTime.UtcNow - _launchTimeUtc;
+                    var upTime = utcNow - _launchTimeUtc;
                     serverStatistics["Up Time"] = $"{upTime.Days}d {upTime:hh\\:mm\\:ss}";
                     serverStatistics["Total RAM (MB)"] = _job.Controls.RamAllocation.ToString();
 
@@ -274,10 +284,10 @@ namespace QuantConnect.Lean.Engine.Results
                     }
 
                     //Send full packet to storage.
-                    if (DateTime.UtcNow > _nextChartsUpdate || _exitTriggered)
+                    if (utcNow > _nextChartsUpdate || _exitTriggered)
                     {
                         Log.Debug("LiveTradingResultHandler.Update(): Pre-store result");
-                        _nextChartsUpdate = DateTime.UtcNow.AddMinutes(1);
+                        _nextChartsUpdate = utcNow.AddTicks(GetChartPeriodUpdate().Ticks);
                         var chartComplete = new Dictionary<string, Chart>();
                         lock (_chartLock)
                         {
@@ -295,26 +305,26 @@ namespace QuantConnect.Lean.Engine.Results
                     }
 
                     // Upload the logs every 1-2 minutes; this can be a heavy operation depending on amount of live logging and should probably be done asynchronously.
-                    if (DateTime.UtcNow > _nextLogStoreUpdate || _exitTriggered)
+                    if (utcNow > _nextLogStoreUpdate || _exitTriggered)
                     {
                         List<LogEntry> logs;
                         Log.Debug("LiveTradingResultHandler.Update(): Storing log...");
                         lock (_logStoreLock)
                         {
-                            var utc = DateTime.UtcNow;
+                            var timeLimit = utcNow.RoundDown(TimeSpan.FromHours(1));
                             logs = (from log in _logStore
-                                    where log.Time >= utc.RoundDown(TimeSpan.FromHours(1))
+                                    where log.Time >= timeLimit
                                     select log).ToList();
                             //Override the log master to delete the old entries and prevent memory creep.
                             _logStore = logs;
                         }
                         StoreLog(logs);
-                        _nextLogStoreUpdate = DateTime.UtcNow.AddMinutes(2);
+                        _nextLogStoreUpdate = utcNow.AddMinutes(2);
                         Log.Debug("LiveTradingResultHandler.Update(): Finished storing log");
                     }
 
                     // Every minute send usage statistics:
-                    if (DateTime.UtcNow > _nextStatisticsUpdate || _exitTriggered)
+                    if (utcNow > _nextStatisticsUpdate || _exitTriggered)
                     {
                         try
                         {
@@ -333,31 +343,37 @@ namespace QuantConnect.Lean.Engine.Results
                         {
                             Log.Error(err, "Error sending statistics:");
                         }
-                        _nextStatisticsUpdate = DateTime.UtcNow.AddMinutes(1);
+                        _nextStatisticsUpdate = utcNow.AddMinutes(1);
                     }
 
 
-                    Log.Debug("LiveTradingResultHandler.Update(): Trimming charts");
-                    lock (_chartLock)
+                    if (utcNow > _nextChartTrimming)
                     {
-                        foreach (var chart in Charts)
+                        Log.Debug("LiveTradingResultHandler.Update(): Trimming charts");
+                        var period = _nextChartTrimmingDayPeriod;
+                        lock (_chartLock)
                         {
-                            foreach (var series in chart.Value.Series)
+                            foreach (var chart in Charts)
                             {
-                                // trim data that's older than 2 days
-                                series.Value.Values =
-                                    (from v in series.Value.Values
-                                     where v.x > Time.DateTimeToUnixTimeStamp(DateTime.UtcNow.AddDays(-2))
-                                     select v).ToList();
+                                foreach (var series in chart.Value.Series)
+                                {
+                                    var timeLimit = Time.DateTimeToUnixTimeStamp(utcNow.AddDays(-period));
+                                    // trim data that's older than '_nextChartTrimmingDayPeriod' days
+                                    series.Value.Values =
+                                        (from v in series.Value.Values
+                                         where v.x > timeLimit
+                                         select v).ToList();
+                                }
                             }
                         }
+                        Log.Debug("LiveTradingResultHandler.Update(): Finished trimming charts");
+                        _nextChartTrimming = utcNow.AddDays(period);
                     }
-                    Log.Debug("LiveTradingResultHandler.Update(): Finished trimming charts");
 
 
                     //Set the new update time after we've finished processing.
                     // The processing can takes time depending on how large the packets are.
-                    _nextUpdate = DateTime.UtcNow.AddSeconds(2);
+                    _nextUpdate = DateTime.UtcNow.AddSeconds(5);
 
                 } // End Update Charts:
             }
@@ -826,11 +842,11 @@ namespace QuantConnect.Lean.Engine.Results
 
                     var highResolutionCharts = new Dictionary<string, Chart>(live.Results.Charts);
 
-                    // minute resoluton data, save today
+                    // minute resolution data, save today
                     var minuteSampler = new SeriesSampler(TimeSpan.FromMinutes(1));
                     var minuteCharts = minuteSampler.SampleCharts(live.Results.Charts, start, stop);
 
-                    // swap out our charts with the sampeld data
+                    // swap out our charts with the sampled data
                     live.Results.Charts = minuteCharts;
                     SaveResults(CreateKey("minute"), live.Results);
 
@@ -854,7 +870,6 @@ namespace QuantConnect.Lean.Engine.Results
                         {
                             IsFrameworkAlgorithm = _algorithm.IsFrameworkAlgorithm,
                             Orders = new Dictionary<int, Order>(live.Results.Orders),
-                            Holdings = new Dictionary<string, Holding>(live.Results.Holdings),
                             Charts = new Dictionary<string, Chart> {{name, live.Results.Charts[name]}}
                         };
 
@@ -1125,6 +1140,26 @@ namespace QuantConnect.Lean.Engine.Results
             {
                 dictionary.Add(key, value);
             }
+        }
+
+        /// <summary>
+        /// This method will return a Minute TimeSpan from 2 to 16 based on the number of charts, as follows:
+        /// For 1-100 charts will return 2 [minute]
+        /// for 100-1k charts will return 4 [minute]
+        /// for 1k charts will return 8 [minutes]
+        /// for 10k charts will return 16 [minutes]
+        /// </summary>
+        private TimeSpan GetChartPeriodUpdate()
+        {
+            var numberOfCharts = Charts.Skip(0).Count();
+            var magnitudeOrder = (int)Math.Log10(numberOfCharts);
+
+            var result = (int)Math.Pow(2, magnitudeOrder);
+            if (result > 16)
+            {
+                result = 16;
+            }
+            return TimeSpan.FromMinutes(result);
         }
     }
 }
